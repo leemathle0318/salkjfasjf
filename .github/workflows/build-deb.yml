@@ -1,0 +1,95 @@
+name: Build OBS Audio Entry Probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      THEOS: ${{ github.workspace }}/work/theos
+      THEOS_COMMIT: 304e0799973e8145f32e4ca2de6c747a84b758ce
+      SDKS_COMMIT: 0222fd5413cf4b9af096f37b4621afa2688572f7
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Locate diagnostic source
+        id: source
+        run: |
+          python3 - <<'PY'
+          import os,stat,zipfile
+          from pathlib import Path,PurePosixPath
+          root=Path.cwd();archives=[]
+          for path in root.rglob('*'):
+              if not path.is_file() or path.suffix.lower()!='.zip' or any(part in {'.git','work','.theos'} for part in path.relative_to(root).parts):continue
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      if 'OBSAudioProbe/AudioProbe.mm' in z.namelist():archives.append(path)
+              except (OSError,zipfile.BadZipFile):pass
+          preferred=root/'OBSAudioProbe-source-0.1.0.zip'
+          archive=preferred if preferred in archives else archives[0] if len(archives)==1 else None
+          search=root
+          if archive:
+              destination=(root/'work/audio-probe-source').resolve()
+              if not destination.is_relative_to(root.resolve()):raise SystemExit('unsafe extraction directory')
+              with zipfile.ZipFile(archive) as z:
+                  members=z.infolist()
+                  if len(members)>100 or sum(m.file_size for m in members)>10*1024*1024:raise SystemExit('unexpected source size')
+                  for m in members:
+                      p=PurePosixPath(m.filename)
+                      if p.is_absolute() or '..' in p.parts or ':' in m.filename or '\\' in m.filename or stat.S_ISLNK(m.external_attr>>16):raise SystemExit('unsafe ZIP path')
+                      if not (destination/m.filename).resolve().is_relative_to(destination):raise SystemExit('ZIP escape')
+                  destination.mkdir(parents=True,exist_ok=True);z.extractall(destination)
+              search=destination
+          elif len(archives)>1:raise SystemExit('multiple diagnostic ZIPs; keep one')
+          candidates=[p.parent for p in search.rglob('AudioProbe.mm') if (p.parent/'Makefile').is_file() and not any(part in {'.git','.theos'} for part in p.relative_to(search).parts)]
+          if len(candidates)!=1:raise SystemExit('Upload OBSAudioProbe-source-0.1.0.zip; not the main OBS camera source')
+          source=candidates[0]
+          for name in ('Makefile','control','AudioProbe.mm','ProbeObserver.mm','ProbeShared.h','OBSAudioProbe.plist','OBSAudioProbeObserver.plist','core/ProbePolicy.hpp','tests/probe_policy_tests.cpp','tests/check_project.py','tests/check_deb.py','tests/test_deb_checker.py','scripts/prepare_packaging.py'):
+              if not (source/name).is_file():raise SystemExit('Missing source '+name)
+          for name in ('Makefile','control','scripts/prepare_packaging.py'):
+              p=source/name;s=p.read_bytes().removeprefix(b'\xef\xbb\xbf').replace(b'\r\n',b'\n').replace(b'\r',b'\n');p.write_bytes(s if s.endswith(b'\n') else s+b'\n')
+          control=(source/'control').read_text()
+          if 'Package: local.xiaoguai.obsbridge.audio-probe' not in control or 'Version: 0.1.0' not in control:raise SystemExit('wrong diagnostic package/version')
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as output:output.write('directory='+source.relative_to(root).as_posix()+'\n')
+          PY
+      - name: Diagnostic policy and package checks
+        working-directory: ${{ steps.source.outputs.directory }}
+        run: |
+          mkdir -p work
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 tests/probe_policy_tests.cpp -o work/probe-policy
+          work/probe-policy
+          python3 tests/check_project.py
+          python3 -m unittest discover -s tests -p test_deb_checker.py -v
+      - name: Pinned Theos and SDK
+        working-directory: ${{ steps.source.outputs.directory }}
+        run: |
+          brew install make ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          git init "$THEOS"
+          git -C "$THEOS" remote add origin https://github.com/theos/theos.git
+          git -C "$THEOS" fetch --depth=1 origin "$THEOS_COMMIT"
+          git -C "$THEOS" checkout --detach FETCH_HEAD
+          git -C "$THEOS" submodule update --init --recursive --depth=1
+          git init work/sdk-checkout
+          git -C work/sdk-checkout remote add origin https://github.com/theos/sdks.git
+          git -C work/sdk-checkout sparse-checkout init --cone
+          git -C work/sdk-checkout sparse-checkout set iPhoneOS16.5.sdk
+          git -C work/sdk-checkout fetch --depth=1 origin "$SDKS_COMMIT"
+          git -C work/sdk-checkout checkout --detach FETCH_HEAD
+          mkdir -p "$THEOS/sdks"
+          cp -R work/sdk-checkout/iPhoneOS16.5.sdk "$THEOS/sdks/"
+      - name: Compile diagnostic deb
+        working-directory: ${{ steps.source.outputs.directory }}
+        run: |
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless TARGET=iphone:clang:16.5:15.0
+          test -n "$(find packages -name '*.deb' -print -quit)"
+          python3 tests/check_deb.py packages/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Audio-Probe-deb
+          path: ${{ steps.source.outputs.directory }}/packages/*.deb
+          if-no-files-found: error
